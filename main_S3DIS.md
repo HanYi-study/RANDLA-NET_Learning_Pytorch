@@ -5,6 +5,7 @@
 2. 什么是cfg？好像是一个文件记载了配置数据。
 3. 优化器Adam详细了解，包含了哪些参数
 4. 学习率的大小对模型收敛程度的影响是什么？
+5. 修改S3DIS数据集Stanford3dDataset_v1.2_Aligned_Version的在main_S3DIS.py和test_S3DIS.py的读取路径为："Y:\projects\data\data_S3DIS\Stanford3dDataset_v1.2_Aligned_Version"(还没有修改第二个data文件夹的名字为data_S3DIS，等数据集复制结束再重命名）
 ---
 ## 主体功能概览：  
 该脚本是 RandLA-Net 在 S3DIS 数据集上的训练与验证主程序，主要完成：
@@ -252,11 +253,23 @@ def train_one_epoch():
     # 用于记录训练过程中每个 batch 的 loss、accuracy、IoU 等统计量
     # 最终用于日志输出
     adjust_learning_rate(optimizer, EPOCH_CNT)
-    # 调用函数-----------------------------------------------------------------------------------------------------------------------------------------------------------08/04
-    net.train()  # set model to training mode
-    iou_calc = IoUCalculator(cfg)  # 初始化IOU计算器
+    # 调用函数调整当前 epoch 的学习率
+    # EPOCH_CNT 是当前训练轮次
+    # 实现逐 epoch 的学习率衰减策略，调用了上一个定义的学习率衰减函数
+    net.train()
+    # 将模型设置为“训练模式”
+    # 启用 dropout 和 BatchNorm 的训练行为
+    iou_calc = IoUCalculator(cfg)
+    # 初始化IOU计算器
+    # 用于后续统计每一类点的分割效果
+    # cfg 提供类别数等配置信息
+
+    # 开始遍历训练数据（按batch）
     for batch_idx, batch_data in enumerate(training_dataloader):
+    # 枚举训练集中的每个批次
+    # batch_data 是一个字典，包含如下键值：xyz, features, labels, neighbors, subs, interp, 等
         t_start = time.time()
+        # 记录当前 batch 的开始时间，用于统计处理速度-------------------------------------------------------------------------------------------------08/04，可参照微信给自己发的最后一条消息继续进行
         for key in batch_data:
             if type(batch_data[key]) is list:
                 for i in range(len(batch_data[key])):
