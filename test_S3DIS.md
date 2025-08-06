@@ -284,28 +284,38 @@ class ModelTester:
         step_id = 0  # 用于计数测试过程中已经执行了多少个 batch
         epoch_id = 0  # 记录测试过程中进行的是第几轮投票（投票策略中每一轮都称为一次“epoch”），num_vote=100 表示将对每个点进行 100 次预测投票；epoch_id 会从 0 计数到 99
         last_min = -0.5  # 用于追踪“测试集采样器”当前所采样点云中 min_pos 的位置是否有变化，若无变化可能跳出循环
+        # last_min 存储上一次循环的 min_pos 值
+        # 若当前 min_pos 与 last_min 相同，说明采样器没有产生新的数据（所有点都已经测试过），测试可以结束
+        # 初始设为 -0.5 是为了确保第一次循环时一定进入测试循环
 
         while last_min < num_vote:
+        # 该 while 循环负责运行测试流程（投票式验证），直到 `last_min >= num_vote`，（键值对的形式）
             stat_dict = {}
-            net.eval() # set model to eval mode (for bn and dp)
-            iou_calc = IoUCalculator(cfg)    
+            # 在模型推理过程中，收集和保存如准确率、IoU、预测分布等信息
+            net.eval() # # 设置网络为 eval 模式（不启用 dropout、batchnorm 的更新）
+            iou_calc = IoUCalculator(cfg)
+            # 创建一个 IoUCalculator 实例，并将配置参数 cfg 传递给它
 
-            for batch_idx, batch_data in enumerate(test_dataloader):
-                for key in batch_data:
+            for batch_idx, batch_data in enumerate(test_dataloader):  # 遍历整个验证集
+            # enumerate 是 Python 的内置函数，用于遍历一个可迭代对象（这里是 test_dataloader），并且同时获得元素的索引（计数）和元素本身
+            # enumerate(test_dataloader) 会依次输出 (index, data_batch)，index 是批次编号，data_batch 是该批次的数据
+                for key in batch_data:  # 将 batch 数据拷贝到 GPU
                     if type(batch_data[key]) is list:
+                    # 判断当前 batch_data 字典中某个键对应的值是否是一个列表，有些数据项可能是多个张量组成的列表
                         for i in range(len(batch_data[key])):
+                        # 如果是列表，则遍历这个列表中的每个元素的索引 i
                             batch_data[key][i] = batch_data[key][i].to(device)
+                            # 将列表中第 i 个元素（通常是张量）通过 .to(device) 方法转移到目标设备（例如 GPU）,并将转移后的张量重新赋值回列表对应的位置
                     else:
                         batch_data[key] = batch_data[key].to(device)
+                        # 如果该键对应的不是列表，直接对该数据执行 .to(device) 转移操作
 
-                # cloud_idx = batch_data['cloud_inds']
-                # point_idx = batch_data['input_inds']
-
-
-                # Forward pass
-                with torch.no_grad():
+                # 模型前向传播
+                with torch.no_grad():  # 不进行梯度计算（节省内存）
                     end_points = net(batch_data)
+                    # 用神经网络模型 net 对输入数据 batch_data 进行一次前向推理（forward pass），得到模型的输出结果 end_points
 
+                # -------------------------------------------------------------------------------------------08/06
                 loss, end_points = compute_loss(end_points, cfg, device)
 
                 # stacked_probs = end_points['valid_logits'].cpu().numpy()          # logit值，还未经过归一化
