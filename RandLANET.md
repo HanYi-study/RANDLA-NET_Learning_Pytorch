@@ -113,7 +113,7 @@ end_points = {
 - 输出：  
   是更新后的 end_points 字典，包含：```python end_points['logits']: 每个点的分类得分 (B, num_classes, N)```
   这是后续 compute_loss() 和 compute_acc() 等模块使用的结果。
-#### 初始化：__init__(self, config)
+#### （1）初始化：__init__(self, config)
 该模型用于定义 RandLA-Net 模型的结构，包括：  
 - 输入预处理（初始 FC 层）
 - 编码器（Encoder）：稀疏采样 + LFA
@@ -195,10 +195,17 @@ def __init__(self, config):
             # 每层解码器用这个模块来变换特征通道，实现特征融合与维度调整
             
         # 5. 最后三层 FC 分类 MLP
-        self.fc1 = pt_utils.Conv2d(d_out, 64, kernel_size=(1,1), bn=True)
-        self.fc2 = pt_utils.Conv2d(64, 32, kernel_size=(1,1), bn=True)
+        # 这段代码定义了神经网络最后几层的全连接（FC）分类多层感知机（MLP）部分，主要用于将解码器输出的特征映射到类别概率。
+        self.fc1 = pt_utils.Conv2d(d_out, 64, kernel_size=(1,1), bn=True)  # 抽取并压缩特征
+        # 定义第一层“全连接”卷积层，将输入特征通道数从 d_out 变换到 64 维。
+        # kernel_size=(1,1)：使用1×1卷积，作用相当于对每个空间位置独立进行全连接映射，不改变空间维度。
+        # bn=True：启用批归一化（Batch Normalization），提升训练稳定性和收敛速度。
+        self.fc2 = pt_utils.Conv2d(64, 32, kernel_size=(1,1), bn=True)  # 加深特征表达，增强非线性
+        # 第二层“全连接”卷积层，将特征从64维进一步映射到32维
         self.dropout = nn.Dropout(0.5)
-        self.fc3 = pt_utils.Conv2d(32, self.config.num_classes, kernel_size=(1,1), bn=False, activation=None)  
+        # 定义一个 dropout 层，训练时以 0.5 的概率随机丢弃部分神经元 / 0.5：丢弃概率为 50% / 防止过拟合，提升模型泛化能力
+        self.fc3 = pt_utils.Conv2d(32, self.config.num_classes, kernel_size=(1,1), bn=False, activation=None)   # 最后一层卷积层，将特征从32维映射到类别数维度，生成每个空间位置上属于各类别的得分。
+        # self.config.num_classes：输出通道数，即类别数量
 ```
 - 流程图：
 ```text
@@ -216,77 +223,160 @@ def __init__(self, config):
         ↓
 每个点的分类 logits
 ```
-#### 前向传播 forward(end_points)
+#### （2）前向传播 forward(end_points)
+RandLA-Net 网络的核心计算流程，决定了点云从输入特征到分类结果是如何一步步处理的，是训练和推理时真正运行的主逻辑。
 ```python
 def forward(self, end_points):
+        # ########################### 输入预处理阶段 ############################
+        features = end_points['features']  # Batch*channel*npoints  # 从 end_points 中提取输入特征，features 维度通常为 [B, C, N]，B: batch 大小/C: 每个点的通道数/N: 点的数量
+        features = self.fc0(features)  # 将输入特征映射到统一的维度（如映射到32维），通过 1x1 卷积进行通道变换
 
-        features = end_points['features']  # Batch*channel*npoints
-        features = self.fc0(features)
+        # ############################ 特征标准化和准备卷积输入 ############################
+        features = self.fc0_acti(features)  # 激活函数
+        features = features.transpose(1,2)  # 从 B*C*N → B*N*C，为 BatchNorm1d 准备
+        features = self.fc0_bath(features)  # 对每个点进行通道维度的归一化
+        # 这三行是为了让初始特征更稳定（归一化 + 非线性激活）。
+        features = features.unsqueeze(dim=3)  # B * N * C → B * N * C * 1 → B * C * N * 1
+        # 增加一个维度，变成 [B, C, N, 1]，方便后续使用 Conv2d(kernel_size=(1,1)) 模块。
 
-        # 下面三行是后面改的
-        features = self.fc0_acti(features)
-        features = features.transpose(1,2)
-        features = self.fc0_bath(features)
+        # ########################### Encoder/下采样 + 特征提取 ############################
+        f_encoder_list = []        # 存储每层的编码特征，用于 Decoder 阶段拼接
+        for i in range(self.config.num_layers):  # 调用 稀疏残差模块（Dilated Residual Block）。
+            f_encoder_i = self.dilated_res_blocks[i](features, end_points['xyz'][i], end_points['neigh_idx'][i])    
+            # 输入：features: 当前层输入特征/xyz[i]: 当前点的坐标/neigh_idx[i]: 邻居索引（用于构建局部区域，比如 KNN）
+            # 出是当前层每个点的局部特征 f_encoder_i
+            f_sampled_i = self.random_sample(f_encoder_i, end_points['sub_idx'][i])  # 对当前层特征 f_encoder_i 进行下采样（使用子采样索引 sub_idx[i]），以减少点数量，提取高层抽象特征。
+            features = f_sampled_i  # 更新 features，用于下一层编码器输入。
+            if i == 0:  # 若保存原始特征（i=0）
+                f_encoder_list.append(f_encoder_i)      # 第一层未采样前的特征也要保存
+            f_encoder_list.append(f_sampled_i)  # 采样后的特征也保存
+        # ########################### 中间层 MLP（中心特征）############################
 
-        features = features.unsqueeze(dim=3)  # Batch*channel*npoints*1 # 增加一个维度，是为了使用2d的[1,1]大小的卷积
+        features = self.decoder_0(f_encoder_list[-1])   # f_encoder_list[-1]：取最深层编码器输出。
+        # decoder_0 是一个 1×1 MLP，用于中心特征变换（维度可能不变），作为 decoder 起点。
 
-        # ###########################Encoder############################
-        f_encoder_list = []         # 用于保存每次LFA后的特征，方便后面进行拼接操作
-        for i in range(self.config.num_layers):
-            f_encoder_i = self.dilated_res_blocks[i](features, end_points['xyz'][i], end_points['neigh_idx'][i])    # 需要用到邻居的索引
-
-            f_sampled_i = self.random_sample(f_encoder_i, end_points['sub_idx'][i])
-            features = f_sampled_i
-            if i == 0:
-                f_encoder_list.append(f_encoder_i)      # 第一次把还没降采样时的也加上，feature维度为32，32在decoder用了两次
-            f_encoder_list.append(f_sampled_i)
-        # ###########################Encoder############################
-
-        features = self.decoder_0(f_encoder_list[-1])   # 中间那层MLP
-
-        # ###########################Decoder############################
+        # ########################### Decoder 解码阶段：插值上采样 + 拼接特征 ############################
         f_decoder_list = []
         for j in range(self.config.num_layers):
-            f_interp_i = self.nearest_interpolation(features, end_points['interp_idx'][-j - 1])                 # 先进行了插值
-            f_decoder_i = self.decoder_blocks[j](torch.cat([f_encoder_list[-j - 2], f_interp_i], dim=1))        # 和之前的特征进行拼接
+            f_interp_i = self.nearest_interpolation(features, end_points['interp_idx'][-j - 1])                 # 对上一层解码特征进行 最近邻插值上采样，将特征从稀疏点插值到较密集的点。使用反向索引 interp_idx[-j-1]：用于找到目标点的最近邻源点。
+            f_decoder_i = self.decoder_blocks[j](torch.cat([f_encoder_list[-j - 2], f_interp_i], dim=1))
+            # torch.cat([...], dim=1)：拼接当前插值特征和 encoder 对应层的特征（skip connection），拼接维度是通道维。
+            # self.decoder_blocks[j]：通过1×1卷积对拼接特征进行通道融合。
 
-            features = f_decoder_i
-            f_decoder_list.append(f_decoder_i)
-        # ###########################Decoder############################
+            features = f_decoder_i  # 更新 features，准备进入下一解码层。
+            f_decoder_list.append(f_decoder_i)  # 保存该层解码特征。
+        # ########################### 三层 MLP 分类头 ############################
 
-        features = self.fc1(features)
-        features = self.fc2(features)
-        features = self.dropout(features)
-        features = self.fc3(features)
-        f_out = features.squeeze(3)
+        features = self.fc1(features)  # 通道变换 d→64，ReLU+BN
+        features = self.fc2(features)  # 64→32，ReLU+BN
+        features = self.dropout(features)  # Dropout 正则化
+        features = self.fc3(features)  # 32→num_classes，输出 raw logits（未激活）
+        f_out = features.squeeze(3)  # 去掉最后一维，变为 [B, num_classes, N]
 
         end_points['logits'] = f_out
         return end_points
+        # 将 logits 存入 end_points，并返回（end_points 是贯穿模型的数据结构，包含坐标、索引、特征等）。
+```
+流程图：
+```test
+输入：end_points['features']，形状 [B, C_in, N]
+
+【1】输入特征处理
+├─ self.fc0(features)
+│   └─ 对原始输入做1x1卷积（相当于每个点的MLP），将通道映射到指定维度
+├─ self.fc0_acti(...)
+│   └─ 对每个点的通道进行激活（如ReLU）
+├─ transpose(1,2)
+│   └─ 将维度 [B, C, N] 转为 [B, N, C]，以满足 BatchNorm1d 的输入格式
+├─ self.fc0_bath(...)
+│   └─ 对每个点的特征做归一化处理，提升训练稳定性
+└─ unsqueeze(dim=3)
+    └─ 增加一个维度 [B, C, N, 1]，为后续使用 Conv2d 做准备
+
+【2】Encoder 编码阶段（提取空间+语义特征，并逐层下采样）
+└─ for i in range(num_layers):
+    ├─ self.dilated_res_blocks[i](features, xyz[i], neigh_idx[i])
+    │   └─ 使用 dilated residual block：
+    │      ▸ 根据 xyz[i] 和邻居索引 neigh_idx[i]
+    │      ▸ 从局部邻域中提取每个点的空间结构特征 → 得到 f_encoder_i
+    ├─ self.random_sample(f_encoder_i, sub_idx[i])
+    │   └─ 使用子采样索引 sub_idx[i]，对 f_encoder_i 下采样 → 得到 f_sampled_i
+    ├─ 保存特征：
+    │   ▸ 第0层：保存 f_encoder_i（未采样），作为高分辨率跳跃连接
+    │   ▸ 每层：保存 f_sampled_i，供解码器使用
+    └─ 更新 features ← f_sampled_i
+
+【3】中间层 MLP（连接编码器和解码器）
+└─ self.decoder_0(f_encoder_list[-1])
+    └─ 对编码器最深层特征做一次1x1卷积映射（相当于中心层 MLP）
+
+【4】Decoder 解码阶段（逐层上采样 + 拼接跳跃连接特征）
+└─ for j in range(num_layers):
+    ├─ self.nearest_interpolation(features, interp_idx[-j - 1])
+    │   └─ 使用最近邻插值，将低分辨率 features 插值到高分辨率点集 → 得到 f_interp_i
+    ├─ torch.cat([f_encoder_list[-j - 2], f_interp_i], dim=1)
+    │   └─ 将 Encoder 对应层的特征与插值结果拼接（通道维），形成融合特征
+    └─ self.decoder_blocks[j](拼接特征)
+        └─ 使用 Conv2d 对融合特征降维并提取语义 → 得到当前层的解码特征
+        └─ 更新 features ← f_decoder_i
+
+【5】三层 MLP 分类模块（每个点输出一个类别得分向量）
+├─ self.fc1(features)
+│   └─ Conv1x1: 通道变换，d → 64，激活+BN
+├─ self.fc2(features)
+│   └─ Conv1x1: 64 → 32，激活+BN
+├─ self.dropout(features)
+│   └─ Dropout：随机丢弃一半神经元，防止过拟合
+└─ self.fc3(features)
+    └─ Conv1x1: 32 → num_classes（类别数），输出 logits（无激活）
+
+【6】输出处理
+├─ squeeze(dim=3)
+│   └─ 从 [B, num_classes, N, 1] → [B, num_classes, N]
+└─ 保存：
+    └─ end_points['logits'] = f_out
+
+输出：end_points（包含 logits、features、xyz 等所有中间数据）
 ```
 
-#### 工具函数1：random_sample(feature, pool_idx)
+#### （3）工具函数1：random_sample(feature, pool_idx)
+- 输入参数：
+ ```
+| 参数名     | 维度               | 说明 |
+|------------|--------------------|------|
+| `feature`  | `[B, C, N, 1]`     | 输入特征张量，表示每个点的特征。<br>- `B`：batch size，<br>- `C`：每个点的特征维度（例如坐标+强度+颜色等），<br>- `N`：原始点云中点的数量 |
+| `pool_idx` | `[B, N', K]`       | 下采样后每个点的 K 个邻居在原始点中的索引。<br>- `N'`：下采样后点的数量，<br>- `K`：每个点对应的邻居数量 |```
+- 输出参数：
+| 输出名            | 维度             | 说明 |
+|------------------|------------------|------|
+| `pool_features`  | `[B, C, N', 1]`  | 对每个下采样点，从 K 个邻居中选取特征最大值后得到的特征值。<br>- 本质上是 K 个邻居在原始特征 `feature` 中，<br>每个通道（feature 维）上取最大值 |
+ 
 ```python
 @staticmethod
+# 作用：从原始特征中提取池化后的特征（用于随机采样）
+# 该函数用于根据提供的索引 pool_idx，从输入特征矩阵 feature 中提取子集特征（采样特征），并对每个点的近邻特征取最大值，作为最终的“池化”特征。这种方式是 RandLA-Net 中进行邻域特征聚合的一步，主要用于构建下采样过程中的局部特征表示。
     def random_sample(feature, pool_idx):       # 由于已经保存了索引值，所以随机采样只是读取索引值
         """
-        :param feature: [B, N, d] input features matrix
-        :param pool_idx: [B, N', max_num] N' < N, N' is the selected position after pooling
+        :param feature: 输入特征张量，形状为 [B, C, N, 1]，即批次大小 × 特征通道数 × 点数量 × 1。
+        :param pool_idx: 邻居索引张量，形状为 [B, N', K]，每个点在随机采样时选择的 K 个邻居索引。
         :return: pool_features = [B, N', d] pooled features matrix
         """
         feature = feature.squeeze(dim=3)    # batch*channel*npoints   # 减少一个维度
-        num_neigh = pool_idx.shape[-1]      # knn邻居的数量
-        d = feature.shape[1]                # 特征维数
-        batch_size = pool_idx.shape[0]      # pool_idx的维度是[6, 10240, 16] 这个16是16个邻居的索引
-        pool_idx = pool_idx.reshape(batch_size, -1)  # batch*(npoints,nsamples)
-        pool_features = torch.gather(feature, 2, pool_idx.unsqueeze(1).repeat(1, feature.shape[1], 1))  # 得到采样后点的特征
-        # 这里先对pool_idx扩充一个中间的feature维度，扩充后为[batch, 1, npoints*nsamples]
-        # 再在这个扩充的维度上将每个batch中的每一行的内容分别repeat feature.shape[1]-1 次（达到feature.shape[1]维） repeat后维度是 [batch, feature.shape[1], npoints*nsamples]
-        # 然后根据这个处理之后的pool_idx进行feature张量的索引
-        pool_features = pool_features.reshape(batch_size, d, -1, num_neigh)
-        pool_features = pool_features.max(dim=3, keepdim=True)[0]  # batch*channel*npoints*1  [0]是取值的意思 [1]是索引 max的意思是在每一维特征中取16近邻点中特征最大的特征
-        return pool_features
+        # 去除特征张量最后一维，使其变成 `[B, C, N]`。将 feature 的形状从 [B, d, N, 1] → [B, d, N]
+        num_neigh = pool_idx.shape[-1]      # knn邻居的数量，获取每个采样点的邻居数量 K
+        d = feature.shape[1]                # 获取特征维度 `d`
+        batch_size = pool_idx.shape[0]      # pool_idx的维度是[6, 10240, 16] 这个16是16个邻居的索引，获取批次大小 B
+        pool_idx = pool_idx.reshape(batch_size, -1)  # batch*(npoints,nsamples)   将原本形状为 [B, N', K] 的 pool_idx reshape 成 [B, N'*K]，方便后续在特征上提取。将每个被采样点的邻居索引展开成一行。
+        pool_features = torch.gather(feature, 2, pool_idx.unsqueeze(1).repeat(1, feature.shape[1], 1))  # 使用 pool_idx 索引 feature，提取被采样点邻域的特征。
+        # pool_idx.unsqueeze(1) → [B, 1, N'*K]
+        # .repeat(1, d, 1) → [B, d, N'*K]，用于对每个特征维度进行采样索引
+        # torch.gather()：从 feature 的第 2 个维度（即点维度）上，按照索引提取邻居特征
+        # 最终得到形状为 [B, d, N'*K]
+        pool_features = pool_features.reshape(batch_size, d, -1, num_neigh)  # 将 [B, d, N'*K] reshape 成 [B, d, N', K]  / 每个采样点对应一个 K 邻居的特征块
+        pool_features = pool_features.max(dim=3, keepdim=True)[0]  # 对最后一个维度（邻居维度 K）做 最大池化 / 输出形状为 [B, d, N', 1] / 代表每个被采样点的聚合特征（取其邻居中特征值最大的）
+        return pool_features  # 返回最终聚合后的特征 [B, d, N', 1]
 ```
-#### 工具函数2：nearest_interpolation(feature, interp_idx)
+#### （4）工具函数2：nearest_interpolation(feature, interp_idx)
 ```python
 @staticmethod
     def nearest_interpolation(feature, interp_idx):
@@ -304,3 +394,10 @@ def forward(self, end_points):
         interpolated_features = interpolated_features.unsqueeze(3)  # batch*channel*npoints*1
         return interpolated_features
 ```
+### 三、自定义函数compute_acc(end_points)
+### 四、IoUCalculator类
+### 五、Dilated_res_block(nn.Module)类
+### 六、Building_block(nn.Module)类
+### 七、Att_pooling(nn.Module)类
+### 八、自定义函数ompute_loss(end_points, cfg, device)
+### 九、自定义函数et_loss(logits, labels, pre_cal_weights, device)
