@@ -340,14 +340,13 @@ def forward(self, end_points):
 ```
 
 #### （3）工具函数1：random_sample(feature, pool_idx)
-- 输入参数：
- ```
-| 参数名     | 维度               | 说明 |
+
+| 输入参数名     | 维度               | 说明 |
 |------------|--------------------|------|
 | `feature`  | `[B, C, N, 1]`     | 输入特征张量，表示每个点的特征。<br>- `B`：batch size，<br>- `C`：每个点的特征维度（例如坐标+强度+颜色等），<br>- `N`：原始点云中点的数量 |
 | `pool_idx` | `[B, N', K]`       | 下采样后每个点的 K 个邻居在原始点中的索引。<br>- `N'`：下采样后点的数量，<br>- `K`：每个点对应的邻居数量 |```
-- 输出参数：
-| 输出名            | 维度             | 说明 |
+
+| 输出参数名            | 维度             | 说明 |
 |------------------|------------------|------|
 | `pool_features`  | `[B, C, N', 1]`  | 对每个下采样点，从 K 个邻居中选取特征最大值后得到的特征值。<br>- 本质上是 K 个邻居在原始特征 `feature` 中，<br>每个通道（feature 维）上取最大值 |
  
@@ -377,27 +376,293 @@ def forward(self, end_points):
         return pool_features  # 返回最终聚合后的特征 [B, d, N', 1]
 ```
 #### （4）工具函数2：nearest_interpolation(feature, interp_idx)
+
+| 输入参数名       | 维度                  | 说明 |
+|--------------|-----------------------|------|
+| `feature`    | `[B, C, N, 1]`        | 输入特征张量，通常是上一次下采样后的点特征。<br>- `B`：batch size，<br>- `C`：特征通道数（如坐标/强度/RGB等），<br>- `N`：下采样后的点数 |
+| `interp_idx` | `[B, up_num_points, 1]` | 最近邻上采样索引。<br>- `up_num_points`：需要上采样的点数，<br>- 表示每个上采样点在下采样点集合中最近的邻居索引。 |
+
+| 输出参数名                | 维度                    | 说明 |
+|------------------------|-------------------------|------|
+| `interpolated_features`| `[B, C, up_num_points, 1]` | 上采样点插值得到的特征。<br>- 每个上采样点使用其最近邻下采样点的特征值直接赋值（无权重），<br>- 所以输出和上采样点数量一致，每个点有 `C` 个特征通道。 |
+
 ```python
 @staticmethod
+# 该函数用于将低分辨率点的特征上采样（恢复）到高分辨率点，用于在解码阶段恢复点云每个点的特征信息。
     def nearest_interpolation(feature, interp_idx):
         """
-        :param feature: [B, N, d] input features matrix
-        :param interp_idx: [B, up_num_points, 1] nearest neighbour index
-        :return: [B, up_num_points, d] interpolated features matrix
+        :param feature: [B, N, d] input features matrix，稀疏点云的特征，通常是池化后的点特征
+        :param interp_idx: [B, up_num_points, 1] nearest neighbour index，每个高分辨率点对应的最近邻索引
+        :return: [B, up_num_points, d] interpolated features matrix，上采样后插值得到的高分辨率特征
         """
-        feature = feature.squeeze(dim=3)  # batch*channel*npoints
-        batch_size = interp_idx.shape[0]
-        up_num_points = interp_idx.shape[1]
-        interp_idx = interp_idx.reshape(batch_size, up_num_points)
+        feature = feature.squeeze(dim=3)  # batch*channel*npoints  # 将 feature 从 [B, d, N, 1] 压缩为 [B, d, N]，便于索引操作。
+        batch_size = interp_idx.shape[0]  # 提取批大小 B 和上采样点数量 up_num_points。
+        up_num_points = interp_idx.shape[1]  # interp_idx 形状为 [B, up_num_points, 1]，表示每个点对应的最近邻下标。
+        interp_idx = interp_idx.reshape(batch_size, up_num_points)  # 将 interp_idx 变为 [B, up_num_points]，去掉最后一个维度，方便使用 torch.gather。
         interpolated_features = torch.gather(feature, 2, interp_idx.unsqueeze(1).repeat(1,feature.shape[1],1))  # 找到要上采样到的点的特征
-        #（我觉得关键点在于数据矩阵的有序性，才可以将特征传播回原来上一次采样前的点）
-        interpolated_features = interpolated_features.unsqueeze(3)  # batch*channel*npoints*1
-        return interpolated_features
+        # 核心操作：特征插值。 nterp_idx.unsqueeze(1) → [B, 1, up_num_points] / .repeat(1, d, 1) → [B, d, up_num_points]，使其与 feature 在通道维对齐  / gather 得到 [B, d, up_num_points]
+        interpolated_features = interpolated_features.unsqueeze(3)  # batch*channel*npoints*1  # 把插值结果扩展回 [B, d, up_num_points, 1] 的格式，与输入保持一致
+        return interpolated_features  返回最终上采样后的点特征，维度 [B, d, up_num_points, 1]。
 ```
 ### 三、自定义函数compute_acc(end_points)
+计算给定预测结果（logits）与真实标签（labels）之间的分类准确率（Accuracy），并将结果保存到 end_points 字典中。
+```python
+def compute_acc(end_points):
+    # 接收一个字典 end_points 作为输入，里面存储模型的中间数据和结果。
+    logits = end_points['valid_logits']
+    # 从字典 end_points 中取出预测的 logits，形状通常为 [N, num_classes]，表示 N 个样本每个类别的预测分数（未经过 softmax）。
+    labels = end_points['valid_labels']
+    # 从字典中取出对应的真实标签，形状为 [N]，是每个样本的类别索引。
+    logits = logits.max(dim=1)[1]  # 对 logits 在类别维度（dim=1）求最大值索引（类别预测结果）
+    # logits.max(dim=1) 返回两个元素：最大值和对应索引 / [1] 取出最大值对应的类别索引，得到预测类别标签，形状为 [N]
+    acc = (logits == labels).sum().float() / float(labels.shape[0])  # 计算预测标签与真实标签的匹配数
+    # (logits == labels) 返回布尔数组，预测正确的位置为 True / .sum() 统计正确预测的数量 / .float() 转为浮点数方便除法运算 / 除以总样本数 labels.shape[0]，得到准确率（0~1 之间）
+    end_points['acc'] = acc  # 将计算得到的准确率保存到 end_points 字典的 acc 字段中，方便后续访问
+    return acc, end_points  # 返回准确率值 acc 以及更新后的字典 end_points
+```
 ### 四、IoUCalculator类
-### 五、Dilated_res_block(nn.Module)类
+IoUCalculator 是用来计算语义分割任务中 各类别的 IoU（Intersection over Union）指标 的工具类。  
+- IoU 是语义分割中衡量模型性能的关键指标。
+- 类中维护了累积的真实类别数、预测类别数和真正类别数，方便批量累积评估。
+- 通过调用 add_data 累积每个 batch 的预测与真实数据。
+- 通过调用 compute_iou 计算所有类别的平均 IoU 和每个类别的 IoU。
+```python
+class IoUCalculator:
+    def __init__(self, cfg):  # cfg：配置对象，包含至少 num_classes（类别数）
+        self.gt_classes = [0 for _ in range(cfg.num_classes)]               # 初始化真实类别计数列表，长度 = 类别数
+        self.positive_classes = [0 for _ in range(cfg.num_classes)]         # 初始化预测类别计数列表
+        self.true_positive_classes = [0 for _ in range(cfg.num_classes)]    # 初始化真正类别计数列表（预测正确的点数）
+        self.cfg = cfg    # 保存配置，主要是类别数
+
+    def add_data(self, end_points):  # end_points：字典，包含当前 batch 的预测结果和真实标签。
+        logits = end_points['valid_logits']     # 忽略了label之后的logit        # 维度是（40960*batch_size）   # 模型预测的logits，[点数×类别数]
+        labels = end_points['valid_labels']     # 忽略了label之后的label        # 真实标签，[点数]
+        pred = logits.max(dim=1)[1]             # [1] 是选择这个max对象的第二个位置，这个max对象长度为二，第一个位置存放取max之后的值，第二个位置存放max值的索引  /  预测类别索引，取每行最大值对应的类别
+        pred_valid = pred.detach().cpu().numpy()
+        labels_valid = labels.detach().cpu().numpy()  # 将 PyTorch tensor 转为 numpy 数组，方便调用 sklearn 计算混淆矩阵。
+
+        correct = np.sum(pred_valid == labels_valid)    # 算预测正确点的个数
+
+        # 计算混淆矩阵（混淆矩阵的列是预测类别，行是真实类别，描述的是正确分类和误分类的个数），使用 sklearn 的 confusion_matrix 函数计算混淆矩阵。
+        conf_matrix = confusion_matrix(labels_valid, pred_valid, np.arange(0, self.cfg.num_classes, 1))   # 混淆矩阵形状为 [num_classes, num_classes]，行是真实类别，列是预测类别。
+        self.gt_classes += np.sum(conf_matrix, axis=1)      # 按行加起来，表示某个类别一共有多少个真实的数据点（ground truth），个类别真实样本数（行求和）
+        self.positive_classes += np.sum(conf_matrix, axis=0)    # 按列加起来，表示某个类别被预测出多少个数据点，个类别被预测为该类别的点数（列求和）
+        self.true_positive_classes += np.diagonal(conf_matrix)  # 取出对角线上的元素，预测正确的点数（对角线）
+
+    def compute_iou(self):  # 用于计算所有类别的 IoU（Intersection over Union） 指标，返回各类别的 IoU 列表，以及所有类别的平均 IoU（mean IoU）
+        iou_list = []  # 创建一个空列表 iou_list，用来保存每个类别的 IoU 值。
+        for n in range(0, self.cfg.num_classes, 1):  # 遍历所有类别，n 表示类别索引，从 0 到类别数-1。
+
+
+            if float(self.gt_classes[n] + self.positive_classes[n] - self.true_positive_classes[n]) != 0:       # 这里就是分母，保证分母不为零，避免除零错误。
+            # 计算分母：真实类别数量 + 预测类别数量 - 预测正确数量。分母表示的是该类别的并集大小。
+                iou = self.true_positive_classes[n] / float(self.gt_classes[n] + self.positive_classes[n] - self.true_positive_classes[n])  # 根据IoU公式计算第 n 类的 IoU
+                iou_list.append(iou)  # 将当前类别的 IoU 值添加到列表中。
+            else:  # 如果分母为零（意味着该类别没有真实标签也没被预测），直接将 IoU 设为 0。
+                iou_list.append(0.0)            # 三者同时为零才有可能分母为零，所以iou=0
+        mean_iou = sum(iou_list) / float(self.cfg.num_classes)  # 计算所有类别的平均 IoU，即所有类别 IoU 的算术平均。
+        return mean_iou, iou_list  # 返回平均 IoU 和每个类别的 IoU 列表。 
+```
+### 五、Dilated_res_block(nn.Module)类 / 膨胀残差块！
+这是 RandLA-Net 中的一个 膨胀残差块（Dilated Residual Block），属于网络的编码器模块的一部分，核心目的是提取局部空间特征，并增强点云的表示能力。它结合了：
+- 多层感受野（dilated feature extraction）；
+- 残差连接（residual connection）；
+- 局部空间感知（通过 Building_block）；
+- MLP 和注意力机制。
+```python
+class Dilated_res_block(nn.Module):
+    def __init__(self, d_in, d_out):
+    # d_in（int）输入特征维度（channel数） / d_out（int）中间特征维度，用于后续膨胀与注意力操作
+        super().__init__()
+        self.mlp1 = pt_utils.Conv2d(d_in, d_out//2, kernel_size=(1,1), bn=True)
+        # 将输入维度从 d_in 降维至 d_out // 2，用于后续局部特征提取（即 LFA 模块的输入）
+        self.lfa = Building_block(d_out)
+        # 构建 Building_block 局部特征聚合模块（通常包含局部编码 + 注意力池化），提取局部空间信息
+        self.mlp2 = pt_utils.Conv2d(d_out, d_out*2, kernel_size=(1, 1), bn=True, activation=None)
+        # 将 LFA 输出的特征升维，便于与残差项（shortcut）相加
+        self.shortcut = pt_utils.Conv2d(d_in, d_out*2, kernel_size=(1,1), bn=True, activation=None)
+        # 直接对原始输入特征进行升维处理，形成残差连接（shortcut），确保维度匹配
+
+    def forward(self, feature, xyz, neigh_idx):
+    # feature：Tensor (B, C_in, N, 1)，点的特征向量
+    # xyz：Tensor (B, N, 3)，每个点的空间坐标
+    # neigh_idx：Tensor (B, N, K)，每个点的邻居索引（KNN索引）
+        f_pc = self.mlp1(feature)  # Batch*channel*npoints*1                # 将输入特征降维，得到新的局部特征，维度变化：(B, d_in, N, 1) → (B, d_out//2, N, 1)
+        f_pc = self.lfa(xyz, f_pc, neigh_idx)  # Batch*d_out*npoints*1      # 使用局部特征聚合模块（Building_block），结合点的空间位置和邻居信息，提取空间结构和语义信息，输出维度：(B, d_out, N, 1)
+        f_pc = self.mlp2(f_pc)                                              # 再通过 MLP 升维至 d_out*2，用于匹配 shortcut 分支的输出维度，便于残差连接，输出维度：(B, d_out*2, N, 1)
+        shortcut = self.shortcut(feature)                                   # 对原始输入 feature 进行升维，维度变换：(B, d_in, N, 1) → (B, d_out*2, N, 1)
+        return F.leaky_relu(f_pc+shortcut, negative_slope=0.2)  # 将主分支 f_pc 和 shortcut 相加，形成残差结构，使用 LeakyReLU 激活增强非线性表示，输出维度：(B, d_out*2, N, 1)，是最终输出特征
+```
+| 组件名     | 功能说明                          | 输入维度                 | 输出维度                   |
+|------------|-----------------------------------|--------------------------|----------------------------|
+| mlp1       | 降维 MLP（Conv+BN+ReLU）          | (B, d_in, N, 1)          | (B, d_out//2, N, 1)        |
+| lfa        | 局部特征聚合（含注意力）         | (B, d_out//2, N, 1)      | (B, d_out, N, 1)           |
+| mlp2       | 升维 MLP（Conv+BN）               | (B, d_out, N, 1)         | (B, d_out*2, N, 1)         |
+| shortcut   | 残差 MLP（Conv+BN）               | (B, d_in, N, 1)          | (B, d_out*2, N, 1)         |
+| add+ReLU   | 残差连接 + 激活                   | (B, d_out*2, N, 1)       | (B, d_out*2, N, 1)         |
+
 ### 六、Building_block(nn.Module)类
+这是 RandLA-Net 的 局部特征聚合模块，其任务是通过：
+- 相对位置编码（Relative Positional Encoding）
+- 多层注意力池化（Attention Pooling）
+来有效提取并聚合局部空间结构 + 语义特征。
+```python
+class Building_block(nn.Module):
+    def __init__(self, d_out):  #  d_in = d_out//2，构造器 __init__
+        super().__init__()
+        self.mlp1 = pt_utils.Conv2d(10, d_out//2, kernel_size=(1,1), bn=True)  # 对输入特征进行通道压缩的 1x1 卷积，相当于一个全连接层
+        self.att_pooling_1 = Att_pooling(d_out, d_out//2)  # 局部特征聚合模块（Local Feature Aggregation），包括两个：局部空间编码（Local Spatial Encoding）/ 注意力池化（Attentive Pooling）
+
+        self.mlp2 = pt_utils.Conv2d(d_out//2, d_out//2, kernel_size=(1, 1), bn=True)  # 将局部聚合后的特征映射到输出维度，不使用激活函数。实现残差连接中的快捷分支（shortcut），将输入特征直接映射到输出维度（维度匹配）。
+        # 同上，输入为 d_in，输出为 d_out*2，也不使用激活函数。
+        self.att_pooling_2 = Att_pooling(d_out, d_out)
+
+    def forward(self, xyz, feature, neigh_idx):  # 对每个点构建局部邻域特征（融合几何信息与特征信息），并通过注意力机制聚合邻域特征，输出每个点的聚合表示。
+        f_xyz = self.relative_pos_encoding(xyz, neigh_idx)  # 调用相对位置编码函数，提取每个点与其邻居的几何关系（比如相对位置、距离、夹角等）。相对位置编码 = 局部空间结构的信息
+        f_xyz = f_xyz.permute((0, 3, 1, 2))  # 转置以匹配卷积输入格式，[B, 10, N, K]，把 f_xyz 的维度转换成适合 2D 卷积的格式。
+        # 这里的 permute 是对维度重排：batch × channel × height × width。
+        f_xyz = self.mlp1(f_xyz)            # MLP 对几何编码进一步提取特征
+        # 将 10 维几何信息通过一个 MLP（通常是 1×1 卷积 + BN + ReLU）提取成更高维的空间特征。
+        f_neighbours = self.gather_neighbour(feature.squeeze(-1).permute((0, 2, 1)), neigh_idx)  # 收集邻居点的特征
+        # 首先把 feature 维度从 [B, C, N, 1] ➝ [B, N, C]/ 然后调用 gather_neighbour 函数，使用邻接索引将每个点的邻居特征提取出来 / 输出维度是 [B, N, K, C]
+        f_neighbours = f_neighbours.permute((0, 3, 1, 2))  # 转置邻居特征以匹配卷积格式，变成 batch × channel × N × K 格式，供后续拼接与注意力聚合使用。
+        f_concat = torch.cat([f_neighbours, f_xyz], dim=1)      # 拼接空间几何信息与邻居特征，沿 channel 维度拼接：融合几何特征和语义特征。
+        f_pc_agg = self.att_pooling_1(f_concat)  # 第一次注意力池化，使用注意力池化对邻域特征进行加权求和，得到每个点的聚合特征。
+        # 输出为每个点一个向量。
+
+        f_xyz = self.mlp2(f_xyz)        # 对空间信息再次编码，再次对 f_xyz 进行 MLP 编码，用于下一次注意力聚合。空间信息经过两层 MLP 编码更稳定
+        f_neighbours = self.gather_neighbour(f_pc_agg.squeeze(-1).permute((0, 2, 1)), neigh_idx)  # 再次收集邻居特征（用第一次聚合后的特征）
+        # 把上次聚合结果 [B, C, N, 1] ➝ [B, N, C]，然后根据邻居索引再次提取每个点的邻居特征 [B, N, K, C]
+        f_neighbours = f_neighbours.permute((0, 3, 1, 2))  #  转置，和之前一样，为拼接做准备，[B, C, N, K]
+        f_concat = torch.cat([f_neighbours, f_xyz], dim=1)  # 再次拼接特征，再次融合上一次聚合后的特征和几何编码特征。
+        f_pc_agg = self.att_pooling_2(f_concat)  # 第二次注意力池化，第二轮注意力加权聚合，进一步增强特征表达能力。
+        return f_pc_agg  # 返回每个点聚合后的最终局部特征 [B, C, N, 1]
+
+    def relative_pos_encoding(self, xyz, neigh_idx):  # 生成每个点与其邻居之间的相对空间几何信息，用于后续注意力机制处理。
+    # 它是 RandLA-Net 网络中用于计算 中心点与其邻居点之间的相对几何位置编码 的一个重要模块，用于融合空间结构信息。
+        neighbor_xyz = self.gather_neighbour(xyz, neigh_idx)  # 根据 neigh_idx 把每个点的 K 个邻居的 xyz 坐标提取出来。
+        # neighbor_xyz 是每个点对应的邻居点坐标。
+
+        xyz_tile = xyz.unsqueeze(2).repeat(1, 1, neigh_idx.shape[-1], 1)
+        # batch*npoint*nsamples*3  这一步类似广播的操作，使得下一行可以直接相减 这一步的结果是中心点自己的xyz矩阵对应论文中的pi
+        # xyz.unsqueeze(2)：把 [B, N, 3] 变成 [B, N, 1, 3]
+        # repeat(...)：在第 2 维（K邻居）方向重复，使其 shape 变成 [B, N, K, 3]，即每个点的 xyz 被复制 K 次
+        # 为了后续做 中心点 - 邻居点 的坐标差，可以直接相减。
+        relative_xyz = xyz_tile - neighbor_xyz  # 计算中心点与每个邻居点之间的相对坐标差（dx, dy, dz）。
+        # 输出：一个三维向量，表示邻居点相对中心点的位移。
+        relative_dis = torch.sqrt(torch.sum(torch.pow(relative_xyz, 2), dim=-1, keepdim=True))  # b计算每个邻居点到中心点的欧氏距离
+        relative_feature = torch.cat([relative_dis, relative_xyz, xyz_tile, neighbor_xyz], dim=-1)  # 拼接所有空间相关信息作为几何编码
+        # relative_dis：1 维 / relative_xyz：3 维 / xyz_tile（中心点坐标）：3 维 / neighbor_xyz（邻居点坐标）：3 维
+        # 拼接后总维度：1 + 3 + 3 + 3 = 10，输出 shape：[B, N, K, 10]，每个中心点有 K 个邻居，每个邻居的空间特征向量为 10 维。
+        return relative_feature  # 返回每个中心点的 K 个邻居对应的 10 维空间特征编码。
+
+    @staticmethod
+    def gather_neighbour(pc, neighbor_idx):  # pc: batch*npoint*channel(xyz或者feature)
+    # 根据每个点的 KNN 索引 neighbor_idx，从原始点云 pc 中提取对应邻居点的坐标或特征，构建一个形状为 [B, N, K, C] 的张量
+    # B 是 batch 大小 / N 是采样点数 / K 是每个点的邻居个数（如 KNN 中的 K） / C 是坐标维度（如 3）或特征维度（如 32/64/...）
+        # gather the coordinates or features of neighboring points
+        batch_size = pc.shape[0]  # batch_size: 每个 batch 中点云的数量；
+        num_points = pc.shape[1]  # num_points: 每个样本中的点数；
+        d = pc.shape[2]  # d: 每个点的特征维度（可能是 3 或 feature dim）。
+        # 分别提取以上三样
+        index_input = neighbor_idx.reshape(batch_size, -1)      # 将 neighbor_idx 从 [B, N, K] reshape 成 [B, N*K]，用于后续一次性 gather 所有邻居点。
+        features = torch.gather(pc, 1, index_input.unsqueeze(-1).repeat(1, 1, pc.shape[2]))     # 从原始点的xyz坐标（或feature）中，找到16个近邻点的坐标（或feature）（注意这个pc矩阵是有序的，其索引值和neighbor_idx有关系）
+        # 核心操作，从 pc 中按照 index_input 进行 gather 操作
+        # index_input.unsqueeze(-1)：将 [B, N*K] 变为 [B, N*K, 1]
+        # .repeat(1, 1, pc.shape[2])：变为 [B, N*K, C]，即每个索引都重复 C 次
+        # torch.gather(pc, 1, ...)：从 pc 的第 1 维（即点数维）中取出指定索引对应的值，得到 [B, N*K, C]
+        features = features.reshape(batch_size, num_points, neighbor_idx.shape[-1], d)  # batch*npoint*nsamples*channel     # 这里就是40960个点中各个点的16近邻的坐标
+        # 将提取出来的 [B, N*K, C] reshape 成 [B, N, K, C]，恢复每个点对应的 K 个邻居的特征结构。
+        return features  # 返回所有点的邻居特征，形状为 [B, N, K, C]。
+```
 ### 七、Att_pooling(nn.Module)类
+这个 Att_pooling 类实现的是**注意力池化/Attention Pooling**机制，用于从一组点云特征中，自适应地聚合信息，它在点云深度学习中常用于将邻域内多个点的特征合成为一个代表中心点的特征。
+- 输入：一个形状为 [B, C_in, N, K] 的特征集合（feature_set），表示每个样本、每个点的 K 个邻居的特征（C 维度）。
+- 输出：一个形状为 [B, C_out, N, 1] 的聚合特征，表示每个点的上下文增强后的输出特征。
+- 通过一个注意力机制（由 self.fc 实现），学习每个邻居在聚合中的权重；再经过一个 MLP 输出新的维度特征。
+- ps:Att_pooling 模拟“注意力机制”的方式，对每个点的邻域特征进行加权聚合，输出增强后的点特征。
+```python
+class Att_pooling(nn.Module):
+    def __init__(self, d_in, d_out):
+        super().__init__()
+        self.fc = nn.Conv2d(d_in, d_in, (1, 1), bias=False)  # 一个 共享的 1×1 卷积层，用于计算注意力分数（注意力分布），维度保持不变。
+        self.mlp = pt_utils.Conv2d(d_in, d_out, kernel_size=(1,1), bn=True)     # 一个带 BatchNorm 的 1×1 MLP，用于将加权后的特征转换为输出维度。
+
+    def forward(self, feature_set):
+
+        att_activation = self.fc(feature_set)           # 对每个点的邻域特征 [B, C, N, K] 进行 1×1 卷积，输出 [B, C, N, K]，作为注意力“得分”。
+        att_scores = F.softmax(att_activation, dim=3)   # 沿着邻域维度 K 做 softmax，使得每个点的邻域注意力权重之和为 1（归一化注意力）。
+        f_agg = feature_set * att_scores                # 原始特征与注意力权重做逐元素相乘，获得加权特征。
+        f_agg = torch.sum(f_agg, dim=3, keepdim=True)   # 沿邻域维度求和，聚合每个点的邻居特征，形状变为 [B, C, N, 1]。
+        f_agg = self.mlp(f_agg)                         # 对聚合特征再用 MLP 调整维度（如从 64 → 128），增强表达能力。
+        return f_agg    # 返回聚合后的特征结果。
+```
 ### 八、自定义函数ompute_loss(end_points, cfg, device)
+用于计算点云语义分割模型的损失函数。主要流程：
+- 提取网络输出的 logits 和 labels；
+- 过滤掉被标记为 ignored 的标签；
+- 映射有效标签；
+- 根据剩余的有效点计算损失；
+- 将计算中间结果记录回 end_points。
+参数说明：
+- end_points: 字典，包含模型的输出，例如 logits, labels 等；
+- cfg: 配置对象，提供类别数、忽略标签等信息；
+- device: 当前使用的设备（如 "cuda" 或 "cpu"）。
+```python
+def compute_loss(end_points, cfg, device):
+
+    logits = end_points['logits']       # 从网络中获取输出的 logits：形状 [B, N, C]，模型每个点对每个类别的预测（还未 softmax）；
+    labels = end_points['labels']       # ground-truth 标签：形状 [B, N]，每个点的真实标签。
+
+    # 调整维度，flatten 所有点
+    logits = logits.transpose(1, 2).reshape(-1, cfg.num_classes)        # [B, C, N] → [B*N, C]
+    labels = labels.reshape(-1)   # [B, N] → [B*N]
+
+    # 构造 ignored label 的布尔掩码                         
+    ignored_bool = torch.zeros(len(labels), dtype=torch.bool).to(device)
+    for ign_label in cfg.ignored_label_inds:                     # 遍历 cfg.ignored_label_inds（如 [0]），将对应点标记为 True
+        ignored_bool = ignored_bool | (labels == ign_label)
+
+    # 获取有效的 logits 和 labels
+    valid_idx = ignored_bool == 0     # 取非 ignored 的点，去除 ignored 点，只保留有效数据
+    valid_logits = logits[valid_idx, :]    # 取对应的 logits
+    valid_labels_init = labels[valid_idx]  # 取对应的 labels
+ 
+    #重新映射标签（关键步骤）
+    reducing_list = torch.arange(0, cfg.num_classes).long().to(device)     # 构造一个 标签映射表，把忽略标签的位置用 0 占位；  
+    inserted_value = torch.zeros((1,)).long().to(device)
+    for ign_label in cfg.ignored_label_inds:
+        reducing_list = torch.cat([reducing_list[:ign_label], inserted_value, reducing_list[ign_label:]], 0)  # reducing_list[i] 表示新标签中 i 应映射为哪个值；
+    # 比如 ignored_label_inds = [0]，原标签 1 映射为新标签 1，原标签 2 映射为新标签 2...但原标签 0 被置为 0。
+
+    valid_labels = torch.gather(reducing_list, 0, valid_labels_init)    # 对 valid_labels_init 中的每个标签，用reducing_list 查找对应的新标签值；将忽略标签替换为 0（虽然不影响最终计算，因为 logits 对应的是有效的标签集合）。
+
+    loss = get_loss(valid_logits, valid_labels, cfg.class_weights, device)  # 计算最终损失，使用 get_loss() 函数对有效点进行损失计算
+
+    end_points['valid_logits'], end_points['valid_labels'] = valid_logits, valid_labels     # valid_logits是ignore label之后的logit
+    end_points['loss'] = loss
+    # 把处理后的有效 logits、labels 和 loss 存到 end_points 字典中；
+    return loss, end_points  # 返回损失值和更新后的 end_points
+```
 ### 九、自定义函数et_loss(logits, labels, pre_cal_weights, device)
+get_loss 函数用于计算加权的交叉熵损失，适用于类别不均衡的语义分割任务。通过给不同类别不同的权重，重点惩罚少数类样本，从而提升模型对罕见类别的识别能力。  
+| 参数名               | 说明                                                   |
+| ----------------- | ---------------------------------------------------- |
+| `logits`          | 模型输出的预测值，形状 `[num_points, num_classes]`，未经过 softmax。 |
+| `labels`          | 真实标签，形状 `[num_points]`，每个元素为对应点的类别索引。                |
+| `pre_cal_weights` | 预先计算好的类别权重数组（numpy 数组），长度为类别数。                       |
+| `device`          | 计算设备，如 `'cuda'` 或 `'cpu'`。                           |
+
+```python
+def get_loss(logits, labels, pre_cal_weights, device):
+
+    class_weights = torch.from_numpy(pre_cal_weights).float().to(device)
+    # 把 numpy 数组的类别权重转换成 PyTorch 张量,转换为浮点型，并移动到指定设备（GPU 或 CPU）,这些权重用来平衡不同类别的重要性。
+    criterion = nn.CrossEntropyLoss(weight=class_weights.reshape([-1]), reduction='none')
+    # 定义交叉熵损失函数 CrossEntropyLoss,传入类别权重，weight 要求是一维张量，表示各类别权重,reduction='none' 表示不对损失值做平均或求和，保持每个样本单独的损失。
+    output_loss = criterion(logits, labels)
+    # 根据 logits 和对应的 labels 计算每个样本的交叉熵损失，形状为 [num_points]。
+    output_loss = output_loss.mean()
+    # 对所有样本的损失取平均，得到一个标量损失值。
+    return output_loss  # 返回平均后的标量损失。
+```
