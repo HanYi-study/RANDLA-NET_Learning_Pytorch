@@ -94,9 +94,12 @@ RandLA-Net-Pytorch-New/
 
 ### 1.2 主要操作
 - 读取 S3DIS 原始数据集（`data/Stanford3dDataset_v1.2_Aligned_Version/`），每个房间一个文件夹，内含多个实例的 txt 文件（XYZRGB，没有标签，文件名或者某种方式可以区分不同实例）。
-- 合并每个房间所有实例的 txt 文件，生成带标签的点云（XYZRGBL）：遍历每个房间文件夹，收集所有实例txt文件。读取每个实例txt文件，添加标签列，存储合并后的点云
+- 合并每个房间所有实例的 txt 文件，生成带标签的点云（XYZRGBL）：遍历每个房间文件夹，收集所有实例txt文件。读取每个实例txt文件，添加**标签列**，存储合并后的点云
 - 对合并后的点云做**网格下采样**（如 0.04m）：
-    - 首先将每个房间的所有txt读取合并为N×7矩阵（xyz rgb label）并保存为ply文件；
+    - 首先将每个房间的所有txt读取合并为**N×7矩阵：xyz rgb label**并保存为ply文件；**原始数据合并后得到的是N×7维度(x,y,z,r,g,b,label)的.ply文件（保存在original_ply/*.ply），用于原始点云存档**
+        - 为什么原始点云数据合并需要保留N×7维度的信息？
+            - 首先是原始数据备份： original_ply/*.ply保留完整的原始信息（XYZRGB+label），用于调试或后续可能的重新处理。
+            - 标签投影需要：proj.pkl中的标签来源于原始点云，需确保与下采样点的空间对应关系正确。
     - 调用DP.grid_sub_sampling()函数（DP为utils.tf_ops或utils.cpp_wrappers下的点云处理库）实现网格采样；
         - 空间网格划分：
             - 首先，将整个点云空间按照0.04米为边长划分为一个个立方体网格（体素，cube/grid）
@@ -107,8 +110,17 @@ RandLA-Net-Pytorch-New/
             - 对应的颜色、标签也通常采用均值或多数投票
         - 输出下采样点云：
             - 每个有点的网格只输出一个代表点（大大减少点数，稀疏化点云）
-    - 下采样结果保存到input_0.040目录下（ply格式，x y z red green blue class）
-- 建立 KDTree 并保存为 pkl。
+    - 下采样结果保存到input_0.040目录下。**网格下采样后得到的是N×6维度(x,y,z,r,g,b)的.ply文件（保存在input_0.040/*.ply），用于存储下采样点云**
+        - 为什么下采样后ply是N×6？
+            - 点云与标签分离：RandLA-Net将几何信息（xyz+rgb）和语义标签分开存储，input_0.040/* .ply仅保存点的几何和颜色特征（用于网络输入），input_0.040/*_proj.pkl保存原始标签及投影关系（用于训练时动态分配标签）
+            - KDTree只需要坐标（xyz）
+            - 标签一致性：标签通过proj.pkl中的proj_inds动态映射到下采样点，避免因下采样导致的标签歧义
+- 建立 **KDTree** 并保存为 pkl：
+    - 首先使用上一步生成的input_0.040/* .ply点云（N×6矩阵，包含xyzrgb）
+    - 其次进行KDTree的构建：提取点云坐标xyz（忽略rgb），使用sklearn.neighbors.KDTree构建空间索引结构。
+    - 然后是保存KDTree，使用pickle序列化KDTree对象，保存为*_KDTree.pkl文件。
+    - 最后是关联投影索引，同时生成*_proj.pkl，记录原始点到下采样点的最近邻索引（利用KDTree加速查询）。
+    - 经过以上处理后输出了```input_0.040/*_KDTree.pkl```（KDTree对象文件，支持高效KNN查询，包含了KDTree索引，用于加速邻域查询）和```input_0.040/*_proj.pkl```（投影索引文件，内容包含了投影索引+原始标签，用于表爱你动态分配）
 - 保存原始点到下采样点的最近邻投影索引和标签为 pkl。
 
 ### 1.3 输入数据
@@ -116,8 +128,8 @@ RandLA-Net-Pytorch-New/
 
 ### 1.4 输出数据
 - `data/original_ply/*.ply`：合并后的原始点云（XYZRGBL）
-- `data/input_0.040/*.ply`：下采样点云（XYZRGBL）
-- `data/input_0.040/*_KDTree.pkl`：KDTree 对象
+- `data/input_0.040/*.ply`：下采样点云（XYZRGB）
+- `data/input_0.040/*_KDTree.pkl`：KDTree 对象，包含了KDTree索引，支持KNN高效查询
 - `data/input_0.040/*_proj.pkl`：原始点到下采样点的投影索引和标签
 
 ---
