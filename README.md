@@ -93,9 +93,21 @@ RandLA-Net-Pytorch-New/
 - `utils/data_prepare_s3dis.py`
 
 ### 1.2 主要操作
-- 读取 S3DIS 原始数据集（`data/Stanford3dDataset_v1.2_Aligned_Version/`），每个房间一个文件夹，内含多个实例的 txt 文件（XYZRGB）。
-- 合并每个房间所有实例的 txt 文件，生成带标签的点云（XYZRGBL）。
-- 对合并后的点云做网格下采样（如 0.04m）。
+- 读取 S3DIS 原始数据集（`data/Stanford3dDataset_v1.2_Aligned_Version/`），每个房间一个文件夹，内含多个实例的 txt 文件（XYZRGB，没有标签，文件名或者某种方式可以区分不同实例）。
+- 合并每个房间所有实例的 txt 文件，生成带标签的点云（XYZRGBL）：遍历每个房间文件夹，收集所有实例txt文件。读取每个实例txt文件，添加标签列，存储合并后的点云
+- 对合并后的点云做**网格下采样**（如 0.04m）：
+    - 首先将每个房间的所有txt读取合并为N×7矩阵（xyz rgb label）并保存为ply文件；
+    - 调用DP.grid_sub_sampling()函数（DP为utils.tf_ops或utils.cpp_wrappers下的点云处理库）实现网格采样；
+        - 空间网格划分：
+            - 首先，将整个点云空间按照0.04米为边长划分为一个个立方体网格（体素，cube/grid）
+            - 每个点 (x, y, z) 通过除以 0.04 并向下取整（floor），落入某一个网格单元。
+        - 网格内点聚合：
+            - 对每个网格，统计所有落入该网格的点。
+            - 常见聚合方式：取网格内所有点的坐标均值（质心）作为代表点
+            - 对应的颜色、标签也通常采用均值或多数投票
+        - 输出下采样点云：
+            - 每个有点的网格只输出一个代表点（大大减少点数，稀疏化点云）
+    - 下采样结果保存到input_0.040目录下（ply格式，x y z red green blue class）
 - 建立 KDTree 并保存为 pkl。
 - 保存原始点到下采样点的最近邻投影索引和标签为 pkl。
 
